@@ -1,0 +1,67 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build installer
+        run: |
+          # Your existing build step, e.g. iscc installer.iss
+          # Produces dist/zoom_v7.2.5.exe
+        shell: pwsh
+
+      - name: Sign installer (Authenticode)
+        shell: pwsh
+        env:
+          SIGN_CERT_BASE64: ${{ secrets.SIGN_CERT_BASE64 }}
+          SIGN_CERT_PASS:   ${{ secrets.SIGN_CERT_PASS }}
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:SIGN_CERT_BASE64))
+          & signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+            /f cert.pfx /p $env:SIGN_CERT_PASS `
+            /d "Invite Recorder" `
+            dist\zoom_v7.2.5.exe
+          Remove-Item cert.pfx
+
+      - name: Verify signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature dist\zoom_v7.2.5.exe
+          if ($sig.Status -ne 'Valid') { throw "Signature invalid: $($sig.Status)" }
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/zoom_v7.2.5.exe
+          tag_name: ${{ github.ref_name }}
+
+      - name: Compute hash + registry entry
+        shell: bash
+        run: |
+          node scripts/sign-and-hash.mjs dist/zoom_v7.2.5.exe \
+            --owner "${{ github.repository_owner }}" \
+            --repo  "${{ github.event.repository.name }}" \
+            --tag   "${{ github.ref_name }}"
+
+      - name: Commit registry.json
+        shell: bash
+        run: |
+          git config user.name  "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git add worker/src/registry.json
+          git commit -m "chore(release): ${{ github.ref_name }} registry update" || echo "no changes"
+          git push
+
+      - name: Deploy Worker
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npx wrangler deploy --config worker/wrangler.toml
