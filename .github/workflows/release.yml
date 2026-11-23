@@ -25,6 +25,46 @@ jobs:
           # Expected output: dist/zoom_v7.2.5.exe
 
       # ==========================================================
+      # LOCATE AND VERIFY SIGNTOOL
+      # ==========================================================
+
+      - name: Locate SignTool
+        shell: pwsh
+        run: |
+          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+
+          if (-not (Test-Path $sdkRoot)) {
+            throw "Windows SDK directory not found: $sdkRoot"
+          }
+
+          $signTool = Get-ChildItem `
+            -Path $sdkRoot `
+            -Filter signtool.exe `
+            -Recurse `
+            -File `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -match '\\x64\\signtool\.exe$'
+            } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if (-not $signTool) {
+            throw "Windows SDK SignTool x64 was not found on this runner."
+          }
+
+          "SIGNTOOL_PATH=$($signTool.FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "SignTool found: $($signTool.FullName)" -ForegroundColor Green
+
+          & $signTool.FullName /?
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "SignTool verification failed."
+          }
+
+      # ==========================================================
       # SIGN INSTALLER
       # ==========================================================
 
@@ -34,12 +74,16 @@ jobs:
           SIGN_CERT_BASE64: ${{ secrets.SIGN_CERT_BASE64 }}
           SIGN_CERT_PASS: ${{ secrets.SIGN_CERT_PASS }}
         run: |
+          if (-not $env:SIGNTOOL_PATH -or -not (Test-Path $env:SIGNTOOL_PATH)) {
+            throw "SignTool executable is unavailable."
+          }
+
           [IO.File]::WriteAllBytes(
             "cert.pfx",
             [Convert]::FromBase64String($env:SIGN_CERT_BASE64)
           )
 
-          & signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+          & "$env:SIGNTOOL_PATH" sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
             /f cert.pfx /p $env:SIGN_CERT_PASS `
             /d "Invite Recorder" `
             dist\zoom_v7.2.5.exe
@@ -62,6 +106,8 @@ jobs:
           if ($sig.Status -ne 'Valid') {
             throw "Signature invalid: $($sig.Status)"
           }
+
+          Write-Host "Authenticode signature verified successfully." -ForegroundColor Green
 
       # ==========================================================
       # GITHUB RELEASE
