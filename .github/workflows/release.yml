@@ -1,4 +1,6 @@
+
 name: Release
+
 on:
   push:
     tags: ['v*']
@@ -8,33 +10,62 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+
     steps:
       - uses: actions/checkout@v4
 
+      # ==========================================================
+      # BUILD INSTALLER
+      # ==========================================================
+
       - name: Build installer
-        run: |
-          # Your existing build step, e.g. iscc installer.iss
-          # Produces dist/zoom_v7.2.5.exe
         shell: pwsh
+        run: |
+          # Preserve your existing installer build command here.
+          # Expected output: dist/zoom_v7.2.5.exe
+
+      # ==========================================================
+      # SIGN INSTALLER
+      # ==========================================================
 
       - name: Sign installer (Authenticode)
         shell: pwsh
         env:
           SIGN_CERT_BASE64: ${{ secrets.SIGN_CERT_BASE64 }}
-          SIGN_CERT_PASS:   ${{ secrets.SIGN_CERT_PASS }}
+          SIGN_CERT_PASS: ${{ secrets.SIGN_CERT_PASS }}
         run: |
-          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:SIGN_CERT_BASE64))
+          [IO.File]::WriteAllBytes(
+            "cert.pfx",
+            [Convert]::FromBase64String($env:SIGN_CERT_BASE64)
+          )
+
           & signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
             /f cert.pfx /p $env:SIGN_CERT_PASS `
             /d "Invite Recorder" `
             dist\zoom_v7.2.5.exe
-          Remove-Item cert.pfx
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installer signing failed."
+          }
+
+          Remove-Item cert.pfx -Force
+
+      # ==========================================================
+      # VERIFY SIGNATURE
+      # ==========================================================
 
       - name: Verify signature
         shell: pwsh
         run: |
           $sig = Get-AuthenticodeSignature dist\zoom_v7.2.5.exe
-          if ($sig.Status -ne 'Valid') { throw "Signature invalid: $($sig.Status)" }
+
+          if ($sig.Status -ne 'Valid') {
+            throw "Signature invalid: $($sig.Status)"
+          }
+
+      # ==========================================================
+      # GITHUB RELEASE
+      # ==========================================================
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -42,26 +73,74 @@ jobs:
           files: dist/zoom_v7.2.5.exe
           tag_name: ${{ github.ref_name }}
 
+      # ==========================================================
+      # COMPUTE HASH AND UPDATE REGISTRY
+      # ==========================================================
+
       - name: Compute hash + registry entry
         shell: bash
         run: |
           node scripts/sign-and-hash.mjs dist/zoom_v7.2.5.exe \
             --owner "${{ github.repository_owner }}" \
-            --repo  "${{ github.event.repository.name }}" \
-            --tag   "${{ github.ref_name }}"
+            --repo "${{ github.event.repository.name }}" \
+            --tag "${{ github.ref_name }}"
+
+      # ==========================================================
+      # COMMIT REGISTRY
+      # ==========================================================
 
       - name: Commit registry.json
         shell: bash
         run: |
-          git config user.name  "release-bot"
+          git config user.name "release-bot"
           git config user.email "release-bot@users.noreply.github.com"
+
           git add worker/src/registry.json
+
           git commit -m "chore(release): ${{ github.ref_name }} registry update" || echo "no changes"
+
           git push
 
-      - name: Deploy Worker
+      # ==========================================================
+      # DEPLOY API WORKER
+      # ==========================================================
+
+      - name: Deploy API Worker (invite-video-events)
         shell: bash
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           npx wrangler deploy --config worker/wrangler.toml
+
+      # ==========================================================
+      # DEPLOY FRONTEND WORKER
+      # ==========================================================
+
+      - name: Validate frontend assets
+        shell: pwsh
+        run: |
+          $requiredFiles = @(
+            "public/index.html",
+            "public/app.js",
+            "public/styles.css",
+            "public/_redirects"
+          )
+
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path $file)) {
+              throw "Required frontend file is missing: $file"
+            }
+          }
+
+          Write-Host "Frontend asset validation successful." -ForegroundColor Green
+
+      - name: Deploy frontend Worker (invite-connect)
+        shell: pwsh
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npx wrangler deploy --config wrangler.jsonc --name invite-connect
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Frontend Worker deployment failed."
+          }
